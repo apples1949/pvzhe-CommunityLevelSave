@@ -1,0 +1,34 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net9.0</TargetFramework>
+    <AssemblyName>JTYCommunityLevelSave</AssemblyName>
+    <LangVersion>latest</LangVersion>
+    <Nullable>disable</Nullable>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <DebugType>none</DebugType>
+    <DebugSymbols>false</DebugSymbols>
+    <Deterministic>true</Deterministic>
+    <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
+    <SatelliteResourceLanguages>en</SatelliteResourceLanguages>
+    <NoWarn>$(NoWarn);MSB3277</NoWarn>
+    <GodotRefDir Condition="'$(GodotRefDir)' == ''"></GodotRefDir>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Reference Include="GodotSharp">
+      <HintPath>$(GodotRefDir)\GodotSharp.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="PlantsVsZombies">
+      <HintPath>$(GodotRefDir)\PlantsVsZombies.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+  </ItemGroup>
+
+  <ItemGroup>
+    <Compile Include="..\..\QrCodeBitmap.cs" Link="QrCodeBitmap.cs" />
+    <Compile Include="..\..\SponsorQrInjector.cs" Link="SponsorQrInjector.cs" />
+  </ItemGroup>
+
+</Project>

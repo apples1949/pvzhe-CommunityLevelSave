@@ -1,0 +1,90 @@
+{
+  "schemaVersion": 2,
+  "id": "communitylevelsave",
+  "name": "每日挑战存档",
+  "version": "3.1.0",
+  "author": "apples1949",
+  "description": "解除每日挑战的自动存档限制：战斗中每 3 秒自动保存全量战场进度（滑动存档），退出后当天重新进入同一关时自动恢复——阳光、已种植物、僵尸波次进度、场上僵尸等与游戏原生存档同等还原度。死亡/通关自动清档防刷；存档按关卡日期自动隔离。",
+  "playInstructions": "1. 进每日挑战 → 正常游玩（每 3 秒后台自动存档一次）。\n2. 中途退出（暂停菜单返回 / 关闭游戏 / 意外崩溃）→ 进度保留在最近一次自动存档。\n3. 当天重新进入同一关 → 自动恢复（有提示）。\n4. 死亡或通关后自动清档（防刷奖励）。\n5. 存档按「关卡日期」隔离：明天的新每日挑战不会读到今天的档。",
+  "dependencies": [],
+  "conflicts": [],
+  "provides": {},
+  "overrides": {},
+  "scripts": [],
+  "runtimeAssembly": "Runtime/ModAssembly.dll",
+  "runtimeEntryType": "CommunityLevelSaveEntry",
+  "runtimeApiVersion": 3,
+  "runtimeAssemblyPolicy": "optional",
+  "blueprints": [],
+  "translations": [],
+  "resources": [
+    "Resources/SponsorQR.png",
+    "Runtime/ModAssembly.dll"
+  ],
+  "settings": [
+    {
+      "key": "enabled",
+      "type": "bool",
+      "label": "启用",
+      "group": "功能",
+      "default": true,
+      "description": "总开关。关闭后不保存也不恢复。",
+      "applyMode": "immediate",
+      "affectsGameplay": false
+    },
+    {
+      "key": "autoSaveOnExit",
+      "type": "bool",
+      "label": "战斗中自动保存",
+      "group": "功能",
+      "default": true,
+      "description": "战斗中每 3 秒自动保存一次战场快照（滑动存档）；死亡/通关后自动清档。",
+      "applyMode": "immediate",
+      "affectsGameplay": false
+    },
+    {
+      "key": "autoLoad",
+      "type": "bool",
+      "label": "进关自动恢复",
+      "group": "功能",
+      "default": true,
+      "description": "当天重新进入同一关时自动恢复上次进度；关闭后只保存不恢复（存档仍保留）。",
+      "applyMode": "immediate",
+      "affectsGameplay": false
+    },
+    {
+      "key": "showNotify",
+      "type": "bool",
+      "label": "显示存读提示",
+      "group": "功能",
+      "default": true,
+      "description": "保存 / 恢复成功时在屏幕左上角显示提示文字。",
+      "applyMode": "immediate",
+      "affectsGameplay": false
+    },
+    {
+      "key": "enableLog",
+      "type": "bool",
+      "label": "输出诊断日志",
+      "group": "诊断",
+      "default": false,
+      "description": "排查问题时打开，会把保存/恢复状态写进 godot.log。",
+      "applyMode": "immediate",
+      "affectsGameplay": false
+    },
+    {
+      "key": "aboutChangelog",
+      "type": "text",
+      "label": "更新内容",
+      "group": "关于",
+      "content": "v3.1.0 · 2026-10-11\n修复：「进度已恢复」提示不自动消失（倒计时未被驱动）。\nv3.0.0 · 2026-10-11\n恢复改为进关即原生恢复（hasProgress 钩子 + 原生存档路径），还原度与游戏自带存档一致。\nv2.1.0 · 2026-10-11\n退出时保存永远失败的修复（改为战斗中每 3 秒滑动保存）。\nv2.0.0 · 2026-10-11\n重写：改用游戏原生存档管线；更名「每日挑战存档」。\nv1.0.0 · 2026-10-10\n首版（社区关卡存档，实际未生效）。"
+    },
+    {
+      "key": "aboutAuthor",
+      "type": "richtext",
+      "label": "作者与链接",
+      "group": "关于",
+      "content": "每日挑战存档 v3.1.0 · 作者：apples1949\n\n[url=https://space.bilibili.com/186773722]B 站空间[/url]\n[url=https://apples1949.lanzouc.com/b007uuknqd]蓝奏云下载（密码 762b）[/url]\n\n本模组为玩家自制 Mod，与《植物大战僵尸杂交重制版》官方无隶属关系。\n赞助：微信扫码支持作者（见下方收款码图片）。"
+    }
+  ]
+}
