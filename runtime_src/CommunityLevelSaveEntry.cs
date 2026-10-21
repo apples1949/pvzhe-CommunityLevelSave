@@ -137,7 +137,7 @@ public sealed class CommunityLevelSaveEntry : IXWModRuntimeEntry
 		TickNotify();   // ★ v3.1 修复：提示文字倒计时（此前未调用 ⇒ 提示永不消失）
 		try
 		{
-			if (true)    /* ★ 用户要求：日志默认关闭（原：!ReadBool(KEnabled, true)） */ { _wasInDailyBattle = false; return; }
+			if (!ReadBool(KEnabled, true)) { _wasInDailyBattle = false; return; }
 
 			TowerDefenseManager mgr = TowerDefenseManager.Instance;
 			TowerDefenseControlNew ctl = (mgr != null && GodotObject.IsInstanceValid(mgr)) ? mgr.currentControl : null;
@@ -361,7 +361,7 @@ public sealed class CommunityLevelSaveEntry : IXWModRuntimeEntry
 
 	private void Notify(string msg)
 	{
-		if (true)    /* ★ 用户要求：日志默认关闭（原：!ReadBool(KNotify, true)） */ { return; }
+		if (!ReadBool(KNotify, true)) { return; }
 		try
 		{
 			if (_tree == null || _tree.Root == null) { return; }
