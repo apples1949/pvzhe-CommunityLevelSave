@@ -28,6 +28,27 @@ using PVZHE.ModEditor.ModSystem;
 /// currentControl 赋值发生在控制器初始化早期（TowerDefenseManager），本 Mod 每帧扫：
 ///   发现「新控制器 + 是每日挑战关卡名」⇒ 立刻设 hasProgress=true（在状态机 SendStateEvent
 ///   之前来得及：_Ready 里 CallDeferred(SendStateEvent)，至少有一帧空档）。
+///
+/// ── v3.2 修复（2026-10-27）：消除「无法恢复关卡进度 / 关卡进度文件不存在」弹窗 ──
+/// ⚠ 那条弹窗**不是本 Mod 产生的**（本文件里没有这条文案，grep 也搜不到）：
+///   host 侧 TowerDefenseNew/TowerDefenseControlNew.cs:1376 拿 hasProgress 去读档，
+///   读不到就 RejectProgressLoad()（同文件 1420-1442）弹「无法恢复关卡进度，原存档已保留。」
+///   文案来自 Core/GameSaveManager/GameSaveManager.cs:1479「关卡进度文件不存在。」
+///   与 1605 的 " 备份：" 拼接（主档 + .pre-relaxed 备份都读不到就是
+///   「关卡进度文件不存在。 备份：关卡进度文件不存在。」——和玩家截图逐字一致）。
+/// ⇒ 结论：**hasProgress 一旦被置 true 而宿主读不到档，就必然弹窗并把玩家踢回主菜单**
+///   （同文件 1422 isGameRunning=false、1452 ChangeScene）。宿主没有任何"模组可撤销"的钩子。
+///
+/// v3.1 及以前的武装条件只有一个**瞬时的 FileAccess.FileExists**（HasSave），而宿主的真正
+/// 读取发生在异步 GameInitEntered 里（前面还有 await EnsureGameplayAtlasesReadyAsync），
+/// 两边隔着若干帧；同时"路径口径"与宿主不一致（宿主 _safeCharRegex=[^\w\-\.]，
+/// 旧实现是 [^\w-]：用户名含 . 时本 Mod 写进去的目录宿主根本不会去看），
+/// 而且完全不校验内容（文件在但坏了 ⇒ 照样武装 ⇒ 照样弹窗）。
+///
+/// v3.2 改为：**只有"宿主自己的读取器确认可读"时才武装**（TryArmRestore 先用
+/// GameSaveManager.TryGetLoadableLevelProgress 预演一次），并把三种"没有可用档"的情况
+/// ——全新进入 / 已被死亡通关清掉 / 跨天过期——全部静默按正常新局处理；
+/// 只有"文件在但内容损坏/反序列化失败"才提示，且文案写明具体文件与原因。
 /// </summary>
 public sealed class CommunityLevelSaveEntry : IXWModRuntimeEntry
 {
@@ -64,7 +85,7 @@ public sealed class CommunityLevelSaveEntry : IXWModRuntimeEntry
 			_context = context;
 			try { _settings = context.Settings; }
 			catch (Exception ex) { Warn("配置不可用：" + ex.GetBaseException().Message); }
-			Log("初始化完成（v3：写原生路径 + hasProgress 钩子，恢复走游戏原生链）。");
+			Log("初始化完成（v3.2：原生路径写在宿主同一位置；只有宿主读取器自检通过才武装恢复）。");
 		}
 		catch (Exception ex) { try { GD.PrintErr(P + "Initialize 异常（已吞）：" + ex.Message); } catch { } }
 	}
@@ -172,15 +193,16 @@ public sealed class CommunityLevelSaveEntry : IXWModRuntimeEntry
 				Log("进入每日挑战：" + _dailyLevelName);
 			}
 
-			// ★ 恢复钩子：控制器出现后、状态机 SendStateEvent 前的最早一帧，
-			//   若有本关存档 ⇒ hasProgress = true，游戏自己走原生恢复链。
-			if (ReadBool(KAutoLoadEnabled, true) && _armedList != ctl.GetInstanceId())
+			// ★ 恢复钩子（v3.2）：控制器出现后、状态机 SendStateEvent 前的最早一帧做一次决策。
+			//   只有 TryArmRestore 确认「宿主稍后一定读得到」时才武装 hasProgress；
+			//   「没档 / 已清档 / 跨天过期」一律静默按正常新局走，只有内容损坏才提示。
+			if (ReadBool(KAutoLoadEnabled, true) && _armedList != ctl.GetInstanceId() && !ctl.isGameRunning)
 			{
 				_armedList = ctl.GetInstanceId();
-				if (HasSave(_dailyLevelName))
+				if (TryArmRestore(_dailyLevelName, ctl))
 				{
 					ctl.hasProgress = true;
-					Log("发现存档，已设置 hasProgress=true ⇒ 游戏将自动走原生恢复：" + _dailyLevelName);
+					Log("存档自检通过，已设置 hasProgress=true ⇒ 游戏将自动走原生恢复：" + _dailyLevelName);
 					Notify("发现每日挑战存档，恢复中…");
 				}
 			}
@@ -287,7 +309,8 @@ public sealed class CommunityLevelSaveEntry : IXWModRuntimeEntry
 			// ★ 全量快照 → 原子写【原生路径】（SaveResourceAtomically 是 internal，手写等价逻辑）
 			var snapshot = new TowerDefenseLevelSaveConfigCSharp();
 			snapshot.Save();
-			string path = SavePath(levelName);
+			string path = NativeProgressPath(levelName);
+			if (string.IsNullOrEmpty(path)) { if (!quiet) { Warn("保存跳过：当前用户名为空。"); } return; }
 			DirAccess.MakeDirRecursiveAbsolute(path.GetBaseDir());
 			string tmp = path.TrimSuffix(".tres") + ".tmp.tres";
 			Error err = ResourceSaver.Save(snapshot, tmp, ResourceSaver.SaverFlags.None);
@@ -295,8 +318,19 @@ public sealed class CommunityLevelSaveEntry : IXWModRuntimeEntry
 			{
 				string dst = ProjectSettings.GlobalizePath(path);
 				string tmpG = ProjectSettings.GlobalizePath(tmp);
-				if (System.IO.File.Exists(dst)) { System.IO.File.Delete(dst); }
-				System.IO.File.Move(tmpG, dst);
+				// ★ v3.2：改成"覆盖式 Move"，**不再"先删旧档再移动"** —— 旧写法一旦 Move 抛异常
+				//   （杀软/云同步占用、磁盘满），旧档已被删、新档没落地 ⇒ 存档凭空消失，
+				//   而下一关进来就正好撞上"文件不存在"。这里失败也只会留下旧档。
+				try
+				{
+					System.IO.File.Move(tmpG, dst, true);
+				}
+				catch (Exception moveEx)
+				{
+					Warn("保存落盘失败（Move 覆盖）：" + moveEx.GetBaseException().Message);
+					try { System.IO.File.Copy(tmpG, dst, true); System.IO.File.Delete(tmpG); }
+					catch (Exception copyEx) { Warn("保存落盘失败（Copy 兜底）：" + copyEx.GetBaseException().Message); return; }
+				}
 				if (!quiet)
 				{
 					string msg = "每日挑战进度已保存";
@@ -312,44 +346,142 @@ public sealed class CommunityLevelSaveEntry : IXWModRuntimeEntry
 		catch (Exception ex) { Warn("保存异常：" + ex.GetBaseException().Message); }
 	}
 
-	/// <summary>★ 原生进度路径（照抄 GameSaveManager.GetLevelProgressPath 的 identity==null 分支）。</summary>
-	private static string SavePath(string levelName)
+	/// <summary>
+	/// ★ 原生进度路径（**逐字照抄** GameSaveManager.GetLevelProgressPath 的 identity==null 分支
+	/// 与 _GetUserCurrentSafe，见 Core/GameSaveManager/GameSaveManager.cs:1259-1266、1322-1325）。
+	/// 用户名为空时返回 ""（宿主同样视为"不可存/不可读"，此时一律不存不读）。
+	/// </summary>
+	private static string NativeProgressPath(string levelName)
 	{
-		string user = "default";
-		try { user = GameSaveManager.Instance.GetUserCurrent(); } catch { }
-		if (string.IsNullOrWhiteSpace(user)) { user = "default"; }
-		string safe = System.Text.RegularExpressions.Regex.Replace(user, "[^\\w-]", "_");
+		if (!TryResolveUserSafe(out string safe)) { return ""; }
+		if (string.IsNullOrEmpty(levelName)) { return ""; }
 		return $"user://Csharp/Progress/{safe}/{levelName}.tres";
 	}
 
-	private bool HasSave(string levelName)
+	/// <summary>★ 宿主备份档名（照抄 GameSaveManager.ProgressBackupPath，见同文件 1471-1474）。</summary>
+	private static string NativeBackupPath(string primary)
 	{
-		return Godot.FileAccess.FileExists(SavePath(levelName));
+		return primary.TrimSuffix(".tres") + ".pre-relaxed.tres";
 	}
 
-	/// <summary>删除进度档（通关/失败防刷）。</summary>
+	/// <summary>
+	/// 用户名脱敏：**必须与宿主 _safeCharRegex = new Regex("[^\\w\\-\\.]") 完全一致**
+	/// （GameSaveManager.cs:104）。曾经用 [^\w-]（少了 \.），用户名含 "." 时本 Mod 写进
+	/// 一个宿主永远不看的目录 ⇒ 玩家"明明有存档"却报"文件不存在"。
+	/// </summary>
+	private static readonly System.Text.RegularExpressions.Regex UserSafeRegex =
+		new System.Text.RegularExpressions.Regex("[^\\w\\-\\.]", System.Text.RegularExpressions.RegexOptions.Compiled);
+
+	private static bool TryResolveUserSafe(out string safe)
+	{
+		safe = "";
+		string user = "";
+		try { user = GameSaveManager.Instance.GetUserCurrent(); } catch { }
+		if (string.IsNullOrWhiteSpace(user)) { return false; }
+		safe = UserSafeRegex.Replace(user, "_");
+		return true;
+	}
+
+	/// <summary>
+	/// 关卡名里带日期（DailyLevel-&lt;yyyy-MM-dd&gt;-&lt;id&gt;）⇒ 与"今天"不同即视为跨天过期。
+	/// 过期档不恢复、也不删除（原档保留），静默按正常新局走。
+	/// </summary>
+	private static bool IsExpiredLevelName(string levelName)
+	{
+		const int prefixLen = 11;   // "DailyLevel-".Length
+		if (string.IsNullOrEmpty(levelName) || levelName.Length < prefixLen + 10) { return false; }
+		string date = levelName.Substring(prefixLen, 10);
+		if (!DateTime.TryParseExact(date, "yyyy-MM-dd",
+				System.Globalization.CultureInfo.InvariantCulture,
+				System.Globalization.DateTimeStyles.None, out DateTime parsed))
+		{
+			return false;   // 名字里没有可解析的日期 ⇒ 不判过期，交给下面的读取器自检
+		}
+		return parsed.Date != DateTime.Now.Date;
+	}
+
+	/// <summary>
+	/// ★ v3.2 核心：决定是否武装 hasProgress。返回 true ⇔ 宿主稍后**一定能**读到档。
+	/// 返回 false 时绝不武装（这样宿主的 RejectProgressLoad 弹窗永远不会因"没有可用档"而出现）。
+	/// </summary>
+	private bool TryArmRestore(string levelName, TowerDefenseControlNew ctl)
+	{
+		if (ctl == null || !GodotObject.IsInstanceValid(ctl)) { return false; }
+
+		string primary = NativeProgressPath(levelName);
+		if (string.IsNullOrEmpty(primary))
+		{
+			Log("不武装：当前用户名为空（宿主同样把它当作不可存读）⇒ 静默按正常新局走。");
+			return false;
+		}
+
+		bool hasPrimary = Godot.FileAccess.FileExists(primary);
+		bool hasBackup = Godot.FileAccess.FileExists(NativeBackupPath(primary));
+		if (!hasPrimary && !hasBackup)
+		{
+			// 情况①全新进入（从来没存过）／情况②存档已被死亡/通关清掉
+			Log("不武装：本关没有进度档（全新进入或已清档）⇒ 静默按正常新局走。");
+			return false;
+		}
+
+		if (IsExpiredLevelName(levelName))
+		{
+			// 情况③跨天存档过期
+			Log("不武装：存档属于往日关卡（跨天过期）⇒ 静默按正常新局走，原档保留：" + primary);
+			return false;
+		}
+
+		// ★ 用它宿主自己的读取器预演一次：能读才武装（等价于宿主 1376 行那次调用）。
+		bool loadable = false;
+		string reason = null;
+		try
+		{
+			loadable = GameSaveManager.Instance != null
+				&& GodotObject.IsInstanceValid(GameSaveManager.Instance)
+				&& GameSaveManager.Instance.TryGetLoadableLevelProgress(levelName, out _, out reason);
+		}
+		catch (Exception ex)
+		{
+			reason = "读取异常：" + ex.GetBaseException().Message;
+		}
+		if (loadable) { return true; }
+
+		if (string.IsNullOrWhiteSpace(reason)) { reason = "未知原因"; }
+		Warn("存档存在但无法读取，已跳过恢复（原档保留）：" + reason + " path=" + primary);
+		NotifyCorrupt(primary, reason);
+		return false;
+	}
+
+	/// <summary>内容损坏/反序列化失败：提示要具体（保留原档 + 说清坏的是哪个文件）。</summary>
+	private void NotifyCorrupt(string path, string reason)
+	{
+		Notify("存档损坏，未恢复（原文件已保留）\n文件：" + path + "\n原因：" + reason, 480);
+	}
+
+	/// <summary>删除进度档（通关/失败防刷）。v3.2：改为精确删三个已知文件，不再用通配符扫目录。</summary>
 	private void DeleteSave(string levelName)
 	{
 		try
 		{
-			string path = SavePath(levelName);
-			if (Godot.FileAccess.FileExists(path))
+			string path = NativeProgressPath(levelName);
+			if (string.IsNullOrEmpty(path)) { return; }
+			string[] targets =
 			{
-				string g = ProjectSettings.GlobalizePath(path);
-				if (System.IO.File.Exists(g)) { System.IO.File.Delete(g); }
-				// 原生备份文件也一并删（.tres 备份命名见 ProgressBackupPath）
-				string dir = System.IO.Path.GetDirectoryName(g);
-				string baseName = System.IO.Path.GetFileNameWithoutExtension(g);
-				if (!string.IsNullOrEmpty(dir) && System.IO.Directory.Exists(dir))
+				path,                                   // 主进度档
+				NativeBackupPath(path),                 // 宿主备份档 .pre-relaxed.tres
+				path.TrimSuffix(".tres") + ".tmp.tres"  // 未落地的临时档
+			};
+			foreach (string p in targets)
+			{
+				try
 				{
-					foreach (string f in System.IO.Directory.GetFiles(dir, baseName + "*"))
-					{
-						try { System.IO.File.Delete(f); } catch { }
-					}
+					string g = ProjectSettings.GlobalizePath(p);
+					if (System.IO.File.Exists(g)) { System.IO.File.Delete(g); }
 				}
+				catch (Exception ex) { Warn("删除存档失败（" + p + "）：" + ex.GetBaseException().Message); }
 			}
 		}
-		catch (Exception ex) { Warn("删除存档失败：" + ex.Message); }
+		catch (Exception ex) { Warn("删除存档失败：" + ex.GetBaseException().Message); }
 	}
 
 	// ============================================================ 提示 / 配置 / 日志
@@ -359,7 +491,7 @@ public sealed class CommunityLevelSaveEntry : IXWModRuntimeEntry
 	private Label _notifyLabel;
 	private int _notifyLeft;
 
-	private void Notify(string msg)
+	private void Notify(string msg, int frames = 180)
 	{
 		if (!ReadBool(KNotify, true)) { return; }
 		try
@@ -383,7 +515,7 @@ public sealed class CommunityLevelSaveEntry : IXWModRuntimeEntry
 				_notifyLabel = l;
 			}
 			_notifyLabel.Text = msg;
-			_notifyLeft = 180;
+			_notifyLeft = frames > 0 ? frames : 180;
 		}
 		catch { }
 	}
