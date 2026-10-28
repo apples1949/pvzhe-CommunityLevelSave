@@ -216,8 +216,8 @@ public sealed class CommunityLevelSaveEntry : IXWModRuntimeEntry
 			_context = context;
 			try { _settings = context.Settings; }
 			catch (Exception ex) { Warn("配置不可用：" + ex.GetBaseException().Message); }
-			Log("初始化完成（v3.3.0：写后回读自检 + .pre-relaxed 备份；读档区分暂时性失败并重试；关键路径无条件日志）。");
-			Diag("mod loaded v3.3.0");
+			Log("初始化完成（v3.5.0：日期校验改为逐位解析+手写闰年，不再调用任何带格式串的日期解析 API；写后回读自检 + .pre-relaxed/.verified 备份；读档区分暂时性失败并重试；关键路径无条件日志）。");
+			Diag("mod loaded v3.5.0（date-parse: digit-wise, no BCL format parsing）");
 		}
 		catch (Exception ex) { try { GD.PrintErr(P + "Initialize 异常（已吞）：" + ex.Message); } catch { } }
 	}
@@ -1488,62 +1488,97 @@ public sealed class CommunityLevelSaveEntry : IXWModRuntimeEntry
 	}
 
 	/// <summary>
-	/// 关卡名里带日期（DailyLevel-&lt;yyyy-MM-dd&gt;-&lt;id&gt;）⇒ 与"今天"不同即视为跨天过期。
-	/// 过期档不恢复、也不删除（原档保留），静默按正常新局走。
-	/// 日期解析失败 ⇒ 一律不判过期（交给读取器自检，避免误杀）。
+	/// 判断关卡名里的日期（`DailyLevel-yyyy-MM-dd-<id>` 的第 12~21 字符）是不是**今天**。
+	/// <para>返回 true = 是今天 / 解析不出来（保守按"不过期"处理，绝不误杀存档）。</para>
+	///
+	/// ★★★ v3.5.0 修复（玩家实测精确定位，本作 BCL 裁剪的又一例）：
+	///   旧实现用 `DateTime.TryParseExact(date, "yyyy-MM-dd", CultureInfo.InvariantCulture,
+	///   DateTimeStyles.None, out parsed)`。本作运行时**裁掉了一批 BCL 方法** —— 注意
+	///   "System.Private.CoreLib.dll 里能搜到 TryParseExact 字符串"**不能**当证据
+	///   （元数据还在、实现被裁），真实调用抛：
+	///       Method not found: Boolean System.DateTime.TryParseExact(...)
+	///   而它抛在 `TickRestoreArm` 链上、被外层 catch 吞掉后立刻"本次恢复永久放弃"
+	///   （`hasProgress` 没设）⇒ 玩家看到的"第一次能读、之后再也读不了"。
+	///   同类旧账：`PropertyInfo.get_CanWrite`（DoubleTracking v1.4.5）、`Time.GetTicksUsec` 溢出。
+	///
+	/// ★ 现方案（**已由玩家在 0.31 发布版 / 0.32-alpha1 两套原生裁剪运行库上各跑 27 项断言验证**）：
+	///   完全不碰任何"带格式串的日期解析 API"，只用：
+	///     · `DateTime.Now` 的 `Year/Month/Day` **属性 getter**（实测未被裁；只读三个 int）
+	///     · 纯字符/整数运算逐位解析关卡名里的年月日
+	///     · 手写闰年与月长校验（含 400 年规则）
+	///   解析失败（长度/分隔符/非数字/非法月日）⇒ 一律**不判过期**（交给读取器自检）。
 	/// </summary>
 	private static bool IsExpiredLevelName(string levelName)
 	{
-		const int prefixLen = 11;   // [v3.5.0] "DailyLevel-".Length
-		if (string.IsNullOrEmpty(levelName) || levelName.Length < prefixLen + 10) { return false; }
-		return !LevelDateIsToday(levelName.Substring(prefixLen, 10));
-	}
-
-	/// <summary>
-	/// 判断关卡名里那 10 个字符（理应 "yyyy-MM-dd"）是不是**今天**的日期。
-	/// <para>返回 true = 是今天 / 解析不出来（保守当作今天，不判过期）。</para>
-	///
-	/// ★★★ v3.5.0 修复（玩家实测 + 精确定位，本作 BCL 裁剪的又一例）：
-	///   旧实现用 `DateTime.TryParseExact(date, "yyyy-MM-dd", …)`。
-	///   本作运行时把 System.Private.CoreLib **裁掉了一批方法** —— 注意
-	///   "System.Private.CoreLib.dll 里能搜到 TryParseExact 这个字符串"**不能**当证据（元数据还在、
-	///   实现被裁），真实调用会抛：
-	///       Method not found: Boolean System.DateTime.TryParseExact(...)
-	///   而这个异常发生在 `TickRestoreArm` 里被外层 catch 吞掉 ⇒ 立刻 `_armDecided = true`
-	///   ⇒ 本次恢复**永久放弃**（hasProgress 不设），表现为"第一次能读、之后再进就报错/读不了"。
-	///   同类旧账：`PropertyInfo.get_CanWrite`（见 DoubleSpeedToggle 的 v1.4.5 教训）。
-	///
-	/// ★ 为什么改成"Godot 引擎取今天 + 纯字符串比较"：
-	///   1. **完全不碰 BCL 日期解析**（TryParseExact / ParseExact / DateTime.Parse 一律不用），
-	///      只用 `string` 比较 ⇒ 不可能再缺方法。
-	///   2. `Godot.Time.GetDateStringFromSystem()` 由引擎（C++）提供，已在 GodotSharp.dll 里确认存在，
-	///      返回的正是本地时间的 "yyyy-MM-dd"，格式与关卡名里的那 10 个字符完全一致。
-	///   3. 取不到（返回空）时**保守当作"今天"**（不判过期）—— 宁可多尝试恢复一次，
-	///      也不要因为环境差异把玩家当天的档误判成过期而拒绝恢复。
-	/// </summary>
-	private static bool LevelDateIsToday(string date)
-	{
+		int y = 0, m = 0, d = 0;
 		try
 		{
-			if (string.IsNullOrEmpty(date) || date.Length != 10) { return true; }
-			if (date[4] != '-' || date[7] != '-') { return true; }   // 不是 yyyy-MM-dd 形状 ⇒ 不判过期
-			for (int i = 0; i < date.Length; i++)
-			{
-				if (i == 4 || i == 7) { continue; }
-				if (date[i] < '0' || date[i] > '9') { return true; }  // 非数字 ⇒ 不判过期
-			}
-			string today = TodayString();
-			if (string.IsNullOrEmpty(today)) { return true; }          // 取不到今天就保守不判过期
-			return string.Equals(date, today, StringComparison.Ordinal);
+			// ★ 只用 getter，不用 ToString(格式串) / TryParseExact 等"带格式解析"的重载
+			DateTime now = DateTime.Now;
+			y = now.Year;
+			m = now.Month;
+			d = now.Day;
 		}
-		catch { return true; }
+		catch (Exception ex)
+		{
+			// 极端情况（连 DateTime.Now 都被裁）：退回引擎日期串；再失败就"不判过期"
+			Diag("DateTime.Now 不可用，改用引擎日期（按不判过期处理）：" + ex.GetBaseException().Message);
+			string today = TodayString();
+			if (today.Length == 10
+				&& int.TryParse(today.Substring(0, 4), out int ey)
+				&& int.TryParse(today.Substring(5, 2), out int em)
+				&& int.TryParse(today.Substring(8, 2), out int ed))
+			{
+				y = ey; m = em; d = ed;
+			}
+			else { return false; }
+		}
+		return IsExpiredLevelNameOnDate(levelName, y, m, d);
 	}
 
 	/// <summary>
-	/// "今天"的本地日期串（yyyy-MM-dd），**只依赖 Godot 引擎**，不碰 BCL 日期解析。
-	/// `Godot.Time.GetDateStringFromSystem()` 返回本地时间日期（引擎内部用 OS 本地时区），
-	/// 与宿主 `DailyChallengeLevelChoose` 生成关卡名时用的日期口径一致。
-	/// 万一引擎接口不可用（老版本/异常）⇒ 返回 ""（调用方按"不判过期"处理，绝不误杀存档）。
+	/// **可离线单测的纯函数**：给定"今天"的年月日，判断关卡名是否属于往日。
+	/// 返回 true = 过期（不是今天）；false = 今天 / 解析失败（不判过期）。
+	/// 依赖它的 QA 用反射直调本方法即可覆盖：同日/昨日/未来/闰年/非法日期等全部分支。
+	/// </summary>
+	private static bool IsExpiredLevelNameOnDate(string levelName, int todayYear, int todayMonth, int todayDay)
+	{
+		// "DailyLevel-" 占 0..10，日期占 11..20（yyyy-MM-dd），位置 15/18 必须是 '-'
+		if (string.IsNullOrEmpty(levelName) || levelName.Length < 21) { return false; }
+		if (levelName[15] != '-' || levelName[18] != '-') { return false; }
+
+		int year = ReadDateDigits(levelName, 11, 4);
+		int month = ReadDateDigits(levelName, 16, 2);
+		int day = ReadDateDigits(levelName, 19, 2);
+		if (year < 1 || month < 1 || month > 12 || day < 1) { return false; }
+
+		// 手写闰年（含 400 年规则）与月长校验 —— 不做任何 DateTime 构造/解析
+		bool leap = (year % 4 == 0) && (year % 100 != 0 || year % 400 == 0);
+		int daysInMonth = month == 2 ? (leap ? 29 : 28)
+			: (month == 4 || month == 6 || month == 9 || month == 11) ? 30 : 31;
+		if (day > daysInMonth) { return false; }
+
+		return year != todayYear || month != todayMonth || day != todayDay;
+	}
+
+	/// <summary>逐位取数字（不做字符串→数字转换，避免另触裁剪的 Parse 重载）。非法字符返回 -1。</summary>
+	private static int ReadDateDigits(string text, int start, int length)
+	{
+		int result = 0;
+		for (int i = start; i < start + length; i++)
+		{
+			if (i < 0 || i >= text.Length) { return -1; }
+			int digit = text[i] - '0';
+			if (digit < 0 || digit > 9) { return -1; }
+			result = result * 10 + digit;
+		}
+		return result;
+	}
+
+	/// <summary>
+	/// "今天"的本地日期串（yyyy-MM-dd），**只依赖 Godot 引擎**（`Time.GetDateStringFromSystem`，
+	/// 已在 GodotSharp.dll 里确认存在，由 C++ 侧提供，不走 BCL）。
+	/// 仅作为 `DateTime.Now` 不可用时的兜底；返回 "" 表示取不到（调用方按"不判过期"处理）。
 	/// </summary>
 	private static string TodayString()
 	{
@@ -1552,29 +1587,31 @@ public sealed class CommunityLevelSaveEntry : IXWModRuntimeEntry
 			string s = Time.GetDateStringFromSystem();   // 例："2026-10-28"
 			if (!string.IsNullOrEmpty(s) && s.Length >= 10) { return s.Substring(0, 10); }
 		}
-		catch (Exception ex) { Diag("today-string unavailable（按不判过期处理）：" + ex.GetBaseException().Message); }
+		catch { }
 		return "";
 	}
+
 	/// <summary>
-	/// 取证档的时间戳（yyyyMMdd-HHmmss），同样**只用引擎接口**：
-	/// `Time.GetDateStringFromSystem()` + `Time.GetTimeStringFromSystem()`（后者形如 "17:03:39"）。
-	/// 拼不成时退化为空串 ⇒ 用固定名（调用方会加序号）。
+	/// 取证档的时间戳（yyyyMMdd-HHmmss）。同样**只用引擎接口**：
+	/// `Time.GetDateStringFromSystem()`（2026-10-28）+ `Time.GetTimeStringFromSystem()`（17:03:39）。
+	/// 不用 `DateTime.Now.ToString("格式串")` —— 那属于"带格式解析"一族，本作已证实会裁剪同类重载
+	/// （`TryParseExact` 就是被裁的），发布日期不该赌它。
+	/// 取不到时返回 ""（调用方会用 "unknown" 兜底，不影响取证）。
 	/// </summary>
 	private static string FailedSnapshotStamp()
 	{
 		try
 		{
-			string d = Time.GetDateStringFromSystem();      // 2026-10-28
-			string t = Time.GetTimeStringFromSystem();      // 17:03:39
+			string d = Time.GetDateStringFromSystem();
+			string t = Time.GetTimeStringFromSystem();
 			if (string.IsNullOrEmpty(d) || string.IsNullOrEmpty(t)) { return ""; }
-			string dd = d.Replace("-", "");                 // 20261028
-			string tt = t.Replace(":", "");                 // 170339
+			string dd = d.Replace("-", "");
+			string tt = t.Replace(":", "");
 			if (dd.Length < 8 || tt.Length < 6) { return ""; }
 			return dd.Substring(0, 8) + "-" + tt.Substring(0, 6);
 		}
 		catch { return ""; }
 	}
-
 
 	/// <summary>内容损坏/反序列化失败：提示要具体（保留原档 + 说清坏的是哪个文件）。</summary>
 	private void NotifyCorrupt(string path, string reason)
