@@ -81,6 +81,40 @@ using PVZHE.ModEditor.ModSystem;
 ///     比对档内 `modSnapshot` 与当前 Mod 环境，不一致就静默新局（避免 Load() 半途失败被踢）。
 ///   D 可观测性：进入关卡 / 预演结果 / 写档 / 回读自检 / 最终决策 这几行**不受 enableLog
 ///     门控**，无条件以 `[DailySave]` 前缀输出（Diag / DiagErr）；其余细节仍受 enableLog。
+///
+/// ── v3.4.0 修复（2026-10-28）：恢复失败**不自毁** ──
+/// 现场（玩家 v3.3.0 日志）：写档端已彻底打通（`save ok size=173888/173901/192464` +
+/// `verify ok` + `backup ok … .pre-relaxed.tres`），但**第 2 次进入恢复失败**
+/// （弹窗 + 被踢回主菜单），之后连读都读不了。⇒ 问题在**读档/恢复**，且是"连环自毁"：
+///
+///   ① 【最可能】恢复后立刻被"半成品"覆盖：v3.3.0 在恢复成功的同一个 GameRunning 里，
+///      3 秒（180 帧）后就把**刚初始化、组件尚未全部走完 GameInitFromProgress**的战场
+///      快照写回主档。宿主 `Load()` 是"边恢复边初始化"，恢复到 `isGameRunning` 为 true
+///      时战场往往还没稳定（暂存角色/掉落物/进程状态仍在补齐）⇒ 主档被半成品覆盖
+///      ⇒ 下次读进来就是"能反序列化但恢复时抛异常"，然后再次覆盖……**逐次恶化**。
+///   ② `PrepareProgressRecovery` 每次把 `AwaitingDecision` 置 true（:1595-1600，字段默认
+///      true 见 :29），而 `GameInitEntered` 那条路径**从不 AcceptProgressRecovery**
+///      （只有 `LoadLevelProgress()`:1249 会 Accept）⇒ 恢复过一次之后
+///      `CanWriteRecoveredProgress()`:1544-1561 恒 false、`DeleteLevelProgress()`:1287-1290
+///      直接 return。宿主的"备份保护"因此永久失效，坏档永远不会被自动隔离。
+///   ③ 长路径：该玩家用户名脱敏后 >100 字符，`user://Csharp/Progress/<长目录>/DailyLevel-…tres`
+///      逼近 Windows MAX_PATH(260)；`DirAccess.MakeDirRecursiveAbsolute` 与手写的
+///      `System.IO.File.Move/Copy` 最容易踩（宿主内部的 FileAccess 走 Godot 自己的封装，
+///      与 .NET 的 MAX_PATH 行为不同）⇒ 可能出现"写成功但读不到"或"备份复制失败"。
+///
+/// v3.4.0 的四项改造（对应任务 A/B/C/D）：
+///   A 恢复后保护期：arm 成功起 **480 帧（≈8 秒）内不写主档**，且必须"真的开跑 + 已稳定
+///     N 个 tick"；期间只写 `*.recover.tres` 旁路（不参与恢复），日志 `save hold(recover grace)`。
+///   B verified 副本：每次自检通过保存后同步一份 `*.verified.tres`（只保留最近一次好档）；
+///     arm 前若主档预演失败/恢复报错，**自动把 verified 复制回主档**再重试一次。
+///     恢复失败**绝不删档**（代码里显式断言并打日志）。
+///   C 长路径加固：所有文件 I/O 统一走 `IoPath()`（Globalize + Windows `\\?\` 前缀）与
+///     `IoMove/IoCopy/IoDelete/IoExists`，每次都记录路径长度，失败标 `stage=longpath`。
+///   D 可观测性：arm 后按 30 帧节流记录恢复过程快照；判定"恢复失败（场景退回菜单）"时
+///     无条件打 `restore failed (scene changed back)` 并把主档另存 `*.failed-<时间戳>.tres` 取证。
+///     ★ 排障口径已写进 mod.json changelog：**看 godot.log 里 `[ProgressLoad]` 开头的行**
+///     （宿主 `RejectProgressLoad` 于 TowerDefenseControlNew.cs:1424 打的，含真正原因），
+///     以及宿主 `ProgressRestoreReport.Record()` 打的 `[ProgressLoad:<类别>] <细节>` 行。
 /// </summary>
 public sealed class CommunityLevelSaveEntry : IXWModRuntimeEntry
 {
@@ -121,6 +155,36 @@ public sealed class CommunityLevelSaveEntry : IXWModRuntimeEntry
 	private const int ArmRetryWindowFrames = 120;
 	/// <summary>两次重试之间的间隔（帧）≈ 0.25 秒 @60fps。</summary>
 	private const int ArmRetryIntervalFrames = 15;
+
+	// ── v3.4.0：恢复后保护期（A）──
+	// 目标：arm 成功之后**绝不**用"刚初始化、尚未稳定"的战场去覆盖主档。
+	private bool _restoreGraceActive;        // 是否处于恢复保护期
+	private int _restoreGraceLeft;           // 保护期剩余帧
+	private int _restoreStableTicks;         // 保护期内"看起来稳定"的帧计数
+	/// <summary>恢复保护期总长度（帧）≈ 8 秒 @60fps（任务 A 建议值）。</summary>
+	private const int RestoreGraceFrames = 480;
+	/// <summary>保护期至少要观察到的稳定 tick 数（≈1 秒）后，才认为战场已稳定。</summary>
+	private const int RestoreStableTicksNeeded = 60;
+
+	// ── v3.4.0：恢复失败判定（D）──
+	private bool _restoreWatched;            // 已 arm，正在观察恢复结果
+	private int _restoreWatchFrames;         // 观察窗口剩余帧
+	private string _restoreWatchScene = "";  // arm 时的场景名（用于判断"退回菜单"）
+	private int _restoreSnapCooldown;        // 恢复过程快照节流
+		/// <summary>恢复观察窗口（帧）≈ 2 秒 @60fps（任务 D 建议值）。</summary>
+	private const int RestoreWatchFrames = 120;
+	/// <summary>恢复过程快照的节流间隔（帧）。</summary>
+	private const int RestoreSnapshotIntervalFrames = 30;
+	/// <summary>
+	/// 观察窗口最多延长几次（每次再等 RestoreWatchFrames 帧）。
+	/// 为什么需要：宿主 GameInitEntered 先 await EnsureGameplayAtlasesReadyAsync，
+	/// 玩家日志里 `fullWallMs≈5 秒` ⇒ 2 秒窗口在慢机器上必然不够，不能据此判失败。
+	/// </summary>
+	private const int RestoreWatchExtendMax = 8;
+	private int _restoreWatchExtend;
+
+	// ── v3.4.0：verified 回退尝试过没有（每控制器只试一次，避免死循环）──
+	private bool _verifiedFallbackTried;
 
 	/// <summary>武装决策结果（v3.3.0：把"损坏"与"暂时性失败"区分开）。</summary>
 	private enum ArmDecision
@@ -265,6 +329,10 @@ public sealed class CommunityLevelSaveEntry : IXWModRuntimeEntry
 			// ★ 恢复钩子（v3.3.0）：把"武装决策"收进 TickRestoreArm（含暂时性失败重试）。
 			if (ReadBool(KAutoLoadEnabled, true)) { TickRestoreArm(ctl); }
 
+			// ★ v3.4.0：恢复保护期推进 + 恢复结果观察（两者都必须在保存判定之前跑）
+			TickRestoreGrace(ctl);
+			TickRestoreWatch(ctl);
+
 			// ── 战斗中：周期滑动保存 ─────────────────────────────────
 			if (ctl.isGameRunning && !ctl.isGameFail)
 			{
@@ -348,6 +416,10 @@ public sealed class CommunityLevelSaveEntry : IXWModRuntimeEntry
 				Log("存档自检通过，已设置 hasProgress=true ⇒ 游戏将自动走原生恢复：" + _dailyLevelName);
 				Diag("arm level=" + _dailyLevelName + " hasProgress=true");
 				Notify("发现每日挑战存档，恢复中…");
+				// ★ v3.4.0（A）：恢复成功后进入保护期，8 秒内不写主档
+				BeginRestoreGrace();
+				// ★ v3.4.0（D）：开始观察恢复结果，失败则取证
+				BeginRestoreWatch();
 				return;
 			}
 
@@ -380,8 +452,26 @@ public sealed class CommunityLevelSaveEntry : IXWModRuntimeEntry
 		}
 		catch (Exception ex)
 		{
-			DiagErr("arm tick 异常：" + ex.GetBaseException().Message);
-			_armDecided = true;
+			// ★★★ v3.5.0 修复（玩家定位 + 要求）：
+			//   旧实现在这里 `_armDecided = true` ⇒ **一次异常就永久放弃本次恢复**。
+			//   而本次真凶 `DateTime.TryParseExact` 缺方法恰恰是在这条链上抛的，
+			//   于是"再一次进关"永远走不到 arm ⇒ 玩家看到的"之后就读不了了"。
+			//   ⇒ 改成与"暂时性失败"同策略：不判定损坏、不永久放弃，
+			//     在窗口内继续重试（`_armRetryFrames` 耗尽才算放弃），并把异常信息带进日志。
+			string msg = ex.GetBaseException().Message;
+			DiagErr("arm tick 异常（可在窗口内重试）level=" + _dailyLevelName + " err=" + msg);
+			_armRetryFrames -= ArmRetryIntervalFrames;
+			_armRetryCooldown = ArmRetryIntervalFrames;
+			if (_armRetryFrames <= 0)
+			{
+				_armDecided = true;
+				Warn("恢复决策多次异常，本次不恢复（存档保留）：" + _dailyLevelName + " err=" + msg);
+				Diag("skip(arm 异常重试耗尽，静默按新局走) level=" + _dailyLevelName + " err=" + msg);
+			}
+			else
+			{
+				Diag("retry(arm 异常) level=" + _dailyLevelName + " remain=" + Math.Max(_armRetryFrames, 0) + " err=" + msg);
+			}
 		}
 	}
 
@@ -393,6 +483,7 @@ public sealed class CommunityLevelSaveEntry : IXWModRuntimeEntry
 		bool hasUser = TryResolveUserSafe(out safe);
 		bool hasPrimary = !string.IsNullOrEmpty(primary) && Godot.FileAccess.FileExists(primary);
 		bool hasBackup = !string.IsNullOrEmpty(primary) && Godot.FileAccess.FileExists(NativeBackupPath(primary));
+		bool hasVerified = !string.IsNullOrEmpty(primary) && IoExists(NativeVerifiedPath(primary));
 		string ctlState = "?";
 		try { ctlState = "running=" + ctl.isGameRunning + " fail=" + ctl.isGameFail + " hasProgress=" + ctl.hasProgress; } catch { }
 		Diag("enter daily level=" + levelName
@@ -400,8 +491,272 @@ public sealed class CommunityLevelSaveEntry : IXWModRuntimeEntry
 			+ " primary=" + (string.IsNullOrEmpty(primary) ? "(无)" : primary)
 			+ " primaryExists=" + hasPrimary
 			+ " backupExists=" + hasBackup
+			+ " verifiedExists=" + hasVerified
+			+ " pathLen=" + PathLen(primary)
 			+ " " + ctlState
 			+ " strictRestore=" + ReadBool(KStrictRestore, false));
+	}
+
+	// ============================================================ v3.4.0（A）恢复后保护期
+
+	/// <summary>
+	/// A：恢复保护期推进。
+	/// 目的：arm 成功后的战场是"宿主边初始化边恢复"的产物，前几秒状态不完整；
+	/// 此时把快照写回主档 ⇒ 主档被半成品覆盖 ⇒ 下次读坏（v3.3.0 的连环自毁链）。
+	/// 规则：保护期内**不写主档**（TrySaveByName 里 checks），只写 `*.recover.tres` 旁路；
+	/// 同时要求"真的开跑 + 连续稳定 N 个 tick"才提前结束保护期。
+	/// </summary>
+	private void TickRestoreGrace(TowerDefenseControlNew ctl)
+	{
+		if (!_restoreGraceActive) { return; }
+		try
+		{
+			if (--_restoreGraceLeft > 0)
+			{
+				// 只有"确实在跑、没失败、关卡控件有效"的帧才算稳定 tick
+				bool stable = false;
+				try
+				{
+					stable = ctl.isGameRunning && !ctl.isGameFail
+						&& GodotObject.IsInstanceValid(ctl.levelControl);
+				}
+				catch { }
+				if (stable)
+				{
+					if (++_restoreStableTicks >= RestoreStableTicksNeeded && _restoreGraceLeft < RestoreGraceFrames - RestoreStableTicksNeeded)
+					{
+						_restoreGraceActive = false;
+						_restoreGraceLeft = 0;
+						Log("恢复保护期结束（已稳定 " + _restoreStableTicks + " tick）。");
+						Diag("recover grace end(early, stable=" + _restoreStableTicks + " tick) level=" + _dailyLevelName);
+					}
+				}
+				else
+				{
+					_restoreStableTicks = 0;   // 不稳定就重新数
+				}
+				return;
+			}
+
+			_restoreGraceActive = false;
+			_restoreGraceLeft = 0;
+			Log("恢复保护期结束（满 " + RestoreGraceFrames + " 帧）。");
+			Diag("recover grace end(full " + RestoreGraceFrames + " frames) level=" + _dailyLevelName);
+		}
+		catch { _restoreGraceActive = false; _restoreGraceLeft = 0; }
+	}
+
+	/// <summary>开始保护期（arm 成功时调用）。</summary>
+	private void BeginRestoreGrace()
+	{
+		_restoreGraceActive = true;
+		_restoreGraceLeft = RestoreGraceFrames;
+		_restoreStableTicks = 0;
+		Log("进入恢复保护期 " + RestoreGraceFrames + " 帧内不写主档（只写 *.recover.tres）。");
+		Diag("recover grace begin frames=" + RestoreGraceFrames + " level=" + _dailyLevelName);
+	}
+
+	// ============================================================ v3.4.0（D）恢复结果观察 / 失败取证
+
+	/// <summary>arm 成功后开始观察恢复结果（窗口 ≈2 秒）。</summary>
+	private void BeginRestoreWatch()
+	{
+		_restoreWatched = true;
+		_restoreWatchFrames = RestoreWatchFrames;
+		_restoreWatchExtend = 0;
+		_restoreSnapCooldown = 0;
+		try { _restoreWatchScene = SceneManager.CurrentScene ?? ""; } catch { _restoreWatchScene = ""; }
+	}
+
+	/// <summary>
+	/// D：恢复结果观察。
+	/// · 每 30 帧（受 enableLog 控制）记录一次恢复过程快照；
+	/// · 若 isGameRunning 在窗口内变 true ⇒ 恢复成功，结束观察；
+	/// · 若窗口耗尽仍未开跑、且场景已不是战斗场景（退回菜单）⇒ **无条件 Error 日志
+	///   `restore failed (scene changed back)` + 把主档另存 `*.failed-<时间戳>.tres` 取证**。
+	/// </summary>
+	private void TickRestoreWatch(TowerDefenseControlNew ctl)
+	{
+		if (!_restoreWatched) { return; }
+		try
+		{
+			bool running = false, fail = false, award = false;
+			int hasProgressField = -1;
+			try
+			{
+				running = ctl.isGameRunning;
+				fail = ctl.isGameFail;
+				award = GodotObject.IsInstanceValid(ctl.levelControl) && ctl.levelControl.awardCreate;
+				hasProgressField = ctl.hasProgress ? 1 : 0;
+			}
+			catch { }
+
+			// 恢复成功：立刻结束观察
+			if (running)
+			{
+				_restoreWatched = false;
+				Log("恢复观察结束：已开跑（isGameRunning=true）。");
+				Diag("restore ok (isGameRunning=true) level=" + _dailyLevelName
+					+ " after=" + (RestoreWatchFrames - _restoreWatchFrames) + "frames");
+				return;
+			}
+
+			// 节流快照（受 enableLog 控制）
+			if (--_restoreSnapCooldown <= 0)
+			{
+				_restoreSnapCooldown = RestoreSnapshotIntervalFrames;
+				string scene = "";
+				try { scene = SceneManager.CurrentScene ?? ""; } catch { }
+				Log("恢复过程快照：hasProgress=" + hasProgressField
+					+ " isGameRunning=" + running
+					+ " isGameFail=" + fail
+					+ " awardCreate=" + award
+					+ " restoreGraceLeft=" + _restoreGraceLeft
+					+ " scene=" + scene
+					+ " (" + (RestoreWatchFrames - _restoreWatchFrames) + "frames)");
+			}
+
+			if (--_restoreWatchFrames > 0) { return; }
+
+			// ★ 窗口耗尽仍未开跑。**不能只凭"没开跑"就判失败** ——
+			//   宿主 GameInitEntered 先 await EnsureGameplayAtlasesReadyAsync（玩家日志里
+			//   fullWallMs≈5 秒），加载慢时 2 秒窗口根本不够。任务 D.2 的判据是
+			//   "仍未开跑 **且** 场景已切回菜单" 两个条件同时成立，这里严格照做：
+			//   · 场景回到菜单类场景 ⇒ 宿主确实 RejectProgressLoad 并把玩家踢回去了 ⇒ 判失败；
+			//   · 场景没回菜单 ⇒ 只是加载慢 ⇒ **延长观察窗口**（最多 RestoreWatchExtendMax 次），
+			//     延长期间仍然只用 Log（受 enableLog）记录，不给玩家任何提示。
+			string nowScene = "";
+			try { nowScene = SceneManager.CurrentScene ?? ""; } catch { }
+			bool sceneIsMenu = IsMenuScene(nowScene);
+			bool sceneChangedBack = sceneIsMenu
+				&& !string.Equals(nowScene, _restoreWatchScene, StringComparison.Ordinal);
+
+			if (!sceneChangedBack && _restoreWatchExtend < RestoreWatchExtendMax)
+			{
+				_restoreWatchExtend++;
+				_restoreWatchFrames = RestoreWatchFrames;
+				Log("恢复观察窗口延长（第 " + _restoreWatchExtend + " 次，仍在加载）：scene=" + nowScene);
+				Diag("restore watch extend#" + _restoreWatchExtend + " level=" + _dailyLevelName
+					+ " scene=" + nowScene + " graceLeft=" + _restoreGraceLeft);
+				return;
+			}
+
+			_restoreWatched = false;
+			if (sceneChangedBack)
+			{
+				string reason = "scene changed back";
+				DiagErr("restore failed (" + reason + ") level=" + _dailyLevelName
+					+ " scene=" + nowScene + " armedScene=" + _restoreWatchScene
+					+ " graceLeft=" + _restoreGraceLeft);
+				// 恢复失败 ⇒ 取消保护期（本次没恢复成功；取证副本已先保存，
+				// 且 v3.4.0 的 verified 会保证下次还有可回退的好档）
+				_restoreGraceActive = false;
+				_restoreGraceLeft = 0;
+				PreserveFailedSnapshot(_dailyLevelName, reason);
+				// ★ B.3 断言：恢复失败**绝不**删档（这里显式复查并打日志）
+				string primary = NativeProgressPath(_dailyLevelName);
+				if (!string.IsNullOrEmpty(primary))
+				{
+					bool stillThere = IoExists(primary);
+					Diag("restore failed: save preserved? primaryExists=" + stillThere + " path=" + primary);
+					if (!stillThere)
+					{
+						DiagErr("restore failed BUT primary is missing（异常：不应发生）path=" + primary);
+					}
+				}
+				return;
+			}
+
+			// 观察窗口延长次数用尽、但场景没回菜单：**不判失败**（保存仍在、下次还能试），
+			// 只留一条 Warn 供排障，不做 took-forensics、不弹窗。
+			Warn("恢复观察超时但场景未回菜单，不判失败（存档保留）：" + _dailyLevelName + " scene=" + nowScene);
+			Diag("restore watch timeout(no menu scene, not failed) level=" + _dailyLevelName
+				+ " scene=" + nowScene + " extends=" + _restoreWatchExtend);
+		}
+		catch (Exception ex)
+		{
+			_restoreWatched = false;
+			DiagErr("restore watch 异常：" + ex.GetBaseException().Message);
+		}
+	}
+
+	/// <summary>场景名是否属于"菜单类"（宿主 RejectProgressLoad 的 OnClose 只会切到这几个）。</summary>
+	private static bool IsMenuScene(string scene)
+	{
+		if (string.IsNullOrEmpty(scene)) { return false; }
+		switch (scene)
+		{
+			case "MainMenu":
+			case "LevelChoose":
+			case "LevelEditorStage":
+				return true;
+			default:
+				return false;
+		}
+	}
+
+	/// <summary>
+	/// D.2：恢复失败 ⇒ 把主档另存为 `*.failed-&lt;yyyyMMdd-HHmmss&gt;.tres` 留作取证（**不删原档**）。
+	/// 只保留最近 5 份，避免目录无限增长。
+	/// </summary>
+	private void PreserveFailedSnapshot(string levelName, string reason)
+	{
+		try
+		{
+			string primary = NativeProgressPath(levelName);
+			if (string.IsNullOrEmpty(primary)) { return; }
+			if (!IoExists(primary))
+			{
+				Diag("failed-snapshot skip: primary missing path=" + primary);
+				return;
+			}
+			string stamp = FailedSnapshotStamp();   // ★ v3.5.0：不再用 DateTime.Now.ToString(fmt)（BCL 裁剪风险）
+			if (string.IsNullOrEmpty(stamp)) { stamp = "unknown"; }   // 引擎时间戳取不到时的兜底名
+			string dst = primary.TrimSuffix(".tres") + ".failed-" + stamp + ".tres";
+			if (!IoCopy(primary, dst, "failed-snapshot"))
+			{
+				DiagErr("failed-snapshot copy fail reason=" + reason + " dst=" + dst);
+				return;
+			}
+			Diag("failed-snapshot ok reason=" + reason + " dst=" + dst + " size=" + FileSize(dst));
+			PruneFailedSnapshots(levelName, 5);
+		}
+		catch (Exception ex)
+		{
+			DiagErr("failed-snapshot 异常：" + ex.GetBaseException().Message);
+		}
+	}
+
+	/// <summary>只保留最近 N 份 `*.failed-*.tres` 取证档（按文件名里的时间戳排序）。</summary>
+	private void PruneFailedSnapshots(string levelName, int keep)
+	{
+		try
+		{
+			string primary = NativeProgressPath(levelName);
+			if (string.IsNullOrEmpty(primary)) { return; }
+			string dirUser = primary.GetBaseDir();
+			string dirAbs = IoPath(dirUser);
+			if (!System.IO.Directory.Exists(dirAbs)) { return; }
+			string stem = levelName + ".failed-";
+			var list = new List<string>();
+			foreach (string f in System.IO.Directory.GetFiles(dirAbs, stem + "*.tres"))
+			{
+				list.Add(f);
+			}
+			if (list.Count <= keep) { return; }
+			list.Sort(StringComparer.Ordinal);   // 时间戳在文件名里 ⇒ 字典序即时间序
+			int remove = list.Count - keep;
+			for (int i = 0; i < remove; i++)
+			{
+				try
+				{
+					System.IO.File.Delete(list[i]);
+					Log("取证档清理（保留最近 " + keep + " 份）：" + list[i]);
+				}
+				catch (Exception ex) { DiagErr("取证档清理失败：" + ex.GetBaseException().Message); }
+			}
+		}
+		catch (Exception ex) { DiagErr("取证档清理异常：" + ex.GetBaseException().Message); }
 	}
 
 	/// <summary>
@@ -482,7 +837,42 @@ public sealed class CommunityLevelSaveEntry : IXWModRuntimeEntry
 				detail = reason + "（读取时已不存在，视为已清档）";
 				return ArmDecision.SkipSilent;
 			}
-			// 内容类：明确损坏 ⇒ 提示一次，原档保留
+
+			// ★ v3.4.0（B.2）：内容类失败 ⇒ 先试 verified 副本回退（每控制器只试一次）
+			if (!_verifiedFallbackTried)
+			{
+				_verifiedFallbackTried = true;
+				if (TryVerifiedFallback(levelName, primary, out string fallbackDetail))
+				{
+					// 回退成功：verified 已覆盖主档，重新走一次宿主预演
+					bool loadable2 = false;
+					string reason2 = null;
+					try
+					{
+						loadable2 = GameSaveManager.Instance != null
+							&& GodotObject.IsInstanceValid(GameSaveManager.Instance)
+							&& GameSaveManager.Instance.TryGetLoadableLevelProgress(levelName, out _, out reason2);
+					}
+					catch (Exception ex) { reason2 = "读取异常：" + ex.GetBaseException().Message; }
+					Diag("preflight(after verified fallback) loadable=" + loadable2
+						+ " reason=" + (reason2 ?? "(空)") + " level=" + levelName);
+					if (loadable2)
+					{
+						// 回退成功：可以 arm（保护期/观察照常）
+						detail = "已从 verified 副本恢复";
+						Diag("verified fallback ok, arm with verified copy level=" + levelName);
+						Notify("主档损坏，已用最近一次校验通过的备份继续", 420);
+						return ArmDecision.Arm;
+					}
+					detail = reason + "；verified 回退后仍不可读：" + (reason2 ?? "(空)");
+				}
+				else
+				{
+					detail = reason + "；" + fallbackDetail;
+				}
+			}
+
+			// 内容类且 verified 也救不回来 ⇒ 提示一次，原档保留
 			Warn("存档存在但无法读取，已跳过恢复（原档保留）：" + reason + " path=" + primary);
 			NotifyCorrupt(primary, reason);
 			return ArmDecision.SkipCorrupt;
@@ -530,6 +920,63 @@ public sealed class CommunityLevelSaveEntry : IXWModRuntimeEntry
 		catch (Exception ex)
 		{
 			reason = "Mod 环境校验异常：" + ex.GetBaseException().Message;
+			return false;
+		}
+	}
+
+	/// <summary>
+	/// ★ v3.4.0（B.2）verified 回退：主档内容类失败时，用"最近一次自检通过的副本"覆盖主档。
+	///
+	/// 为什么敢覆盖主档：主档此刻已经**确认读不出来**（Content 类 reason：无法读取关卡进度资源 /
+	/// 读取关卡进度失败），留着它只会让玩家永远"读不了"；而 verified 是最近一次
+	/// `verify ok` 的字节级副本 ⇒ 覆盖是严格改善。原来的坏主档**不会丢**：
+	/// 覆盖前先另存 `*.failed-&lt;时间戳&gt;.tres` 取证（见 PreserveFailedSnapshot 的同名思路）。
+	/// </summary>
+	private bool TryVerifiedFallback(string levelName, string primary, out string detail)
+	{
+		detail = "";
+		try
+		{
+			string verified = NativeVerifiedPath(primary);
+			if (!IoExists(verified))
+			{
+				detail = "没有 verified 副本可回退";
+				return false;
+			}
+			// 先把坏主档留一份取证（不删）
+			PreserveFailedSnapshot(levelName, "content-broken-before-verified-fallback");
+
+			// verified 自身也必须能读，否则覆盖过去也没意义
+			TowerDefenseLevelSaveConfigCSharp probe = LoadProgressFile(verified);
+			if (probe == null)
+			{
+				detail = "verified 副本也读不出来";
+				DiagErr("verified fallback abort: verified unreadable path=" + verified
+					+ " len=" + PathLen(verified));
+				return false;
+			}
+
+			if (!IoCopy(verified, primary, "verified-fallback"))
+			{
+				detail = "verified 复制回主档失败";
+				return false;
+			}
+			// 再回读确认
+			TowerDefenseLevelSaveConfigCSharp after = LoadProgressFile(primary);
+			if (after == null)
+			{
+				detail = "verified 回退后主档仍读不出来";
+				DiagErr("verified fallback: primary unreadable after copy path=" + primary);
+				return false;
+			}
+			Diag("verified fallback ok from=" + verified + " to=" + primary
+				+ " size=" + FileSize(primary) + " len=" + PathLen(primary));
+			return true;
+		}
+		catch (Exception ex)
+		{
+			detail = "verified 回退异常：" + ex.GetBaseException().Message;
+			DiagErr("verified fallback 异常：" + ex.GetBaseException().Message);
 			return false;
 		}
 	}
@@ -606,6 +1053,22 @@ public sealed class CommunityLevelSaveEntry : IXWModRuntimeEntry
 		_armDecided = false;
 		_armRetryFrames = 0;
 		_armRetryCooldown = 0;
+		// ★ v3.4.0：保护期 / 观察窗口 / verified 回退标记也一起复位
+		//   注意：**不在这里"补救"失败判定** —— 恢复失败要走 TickRestoreWatch 的取证分支
+		//   （它会在控制器失效前触发）；这里只是兜底清状态，避免状态跨关卡泄漏。
+		if (_restoreWatched)
+		{
+			DiagErr("restore failed (control lost before watch completed) level=" + _armLevelName);
+			PreserveFailedSnapshot(_armLevelName, "control-lost");
+		}
+		_restoreGraceActive = false;
+		_restoreGraceLeft = 0;
+		_restoreStableTicks = 0;
+		_restoreWatched = false;
+		_restoreWatchFrames = 0;
+		_restoreWatchExtend = 0;
+		_restoreWatchScene = "";
+		_verifiedFallbackTried = false;
 	}
 
 	private static bool IsDailyLevel(string levelName)
@@ -706,22 +1169,36 @@ public sealed class CommunityLevelSaveEntry : IXWModRuntimeEntry
 				return;
 			}
 
+			// ★ v3.4.0（A）：恢复保护期内**不写主档**。
+			//   理由：刚恢复出来的战场是"宿主边初始化边恢复"的产物，前几秒组件状态不完整；
+			//   此时把快照写回主档 ⇒ 主档被半成品覆盖 ⇒ 下次读坏（v3.3.0 的连环自毁链）。
+			//   保护期内只写 *.recover.tres 旁路（不参与恢复、不更新 verified），
+			//   玩家这次会话若崩溃也只损失"恢复后的这段进度"，而不会污染仅存的好档。
+			bool holdPrimary = _restoreGraceActive;
+			string target = holdPrimary ? NativeRecoverSidePath(path) : path;
+			if (holdPrimary)
+			{
+				Log("save hold(recover grace) 保护期内不写主档，改写旁路：" + target + " graceLeft=" + _restoreGraceLeft);
+			}
+
 			// ② 目录（结果以前被忽略 ⇒ 现在检查并打印）
 			Error dirErr = DirAccess.MakeDirRecursiveAbsolute(path.GetBaseDir());
 			if (dirErr != Error.Ok && dirErr != Error.AlreadyExists)
 			{
-				DiagErr("save fail stage=mkdir err=" + dirErr + " path=" + path + " dir=" + path.GetBaseDir());
+				DiagErr("save fail stage=mkdir err=" + dirErr + " path=" + path
+					+ " dir=" + path.GetBaseDir() + " len=" + PathLen(path));
 				return;
 			}
 
 			// ③ A.3：Move 之前把旧档复制成 .pre-relaxed.tres
 			//    （与宿主 EnsureProgressBackup:1531-1542 语义一致：**仅当备份不存在时生成**，
 			//     这样备份保留的是"最早那份好档"，宿主读主档失败时会自动回退到它）
-			EnsureBackupBeforeOverwrite(path);
+			//    保护期内写的是旁路文件，不碰主档 ⇒ 也不需要备份主档。
+			if (!holdPrimary) { EnsureBackupBeforeOverwrite(path); }
 
 			// ④ tmp + 原子 Move（宿主 SaveResourceAtomically:484-556 的等价实现；
 			//    窗口 500-509 会先删残留 tmp，我们以前漏了这一步，这里补上）
-			string tmp = path.TrimSuffix(".tres") + ".tmp.tres";
+			string tmp = target.TrimSuffix(".tres") + ".tmp.tres";
 			DeleteGlobalized(tmp);
 			Error err = Error.Ok;
 			try { err = ResourceSaver.Save(snapshot, tmp, ResourceSaver.SaverFlags.None); }
@@ -738,61 +1215,71 @@ public sealed class CommunityLevelSaveEntry : IXWModRuntimeEntry
 				return;
 			}
 
-			try
+			// ★ v3.4.0（C）：Move/Copy 全部改走长路径安全的 IoMove/IoCopy
+			if (!IoMove(tmp, target, "save-move"))
 			{
-				System.IO.File.Move(Globalize(tmp), Globalize(path), true);
-			}
-			catch (Exception moveEx)
-			{
-				DiagErr("save fail stage=move err=" + moveEx.GetBaseException().Message + " from=" + tmp + " to=" + path);
-				try
+				if (!IoCopy(tmp, target, "save-copy"))
 				{
-					System.IO.File.Copy(Globalize(tmp), Globalize(path), true);
 					DeleteGlobalized(tmp);
-				}
-				catch (Exception copyEx)
-				{
-					DiagErr("save fail stage=copy err=" + copyEx.GetBaseException().Message + " to=" + path);
 					return;
 				}
+				DeleteGlobalized(tmp);
 			}
 
-			long size = FileSize(path);
-			Diag("save ok path=" + path + " size=" + size);
+			long size = FileSize(target);
+			Diag("save ok path=" + target + " size=" + size + " len=" + PathLen(target)
+				+ (holdPrimary ? " hold=recover-grace" : ""));
 
 			// ⑤ A.2：写后**回读自检**（宿主同款读取器 + CanLoad）
-			if (VerifySaved(path, out string verifyReason))
+			if (VerifySaved(target, out string verifyReason))
 			{
-				Diag("verify ok path=" + path);
+				Diag("verify ok path=" + target);
+				// ★ v3.4.0（B.1）：只有"写主档且自检通过"才更新 verified 副本。
+				//   保护期内的旁路档是半成品，绝不能当 verified。
+				if (!holdPrimary) { UpdateVerifiedCopy(path); }
 				if (!quiet)
 				{
-					string msg = "每日挑战进度已保存";
-					Log(msg + " → " + path);
+					string msg = holdPrimary ? "每日挑战进度已保存（恢复保护期，暂存旁路）" : "每日挑战进度已保存";
+					Log(msg + " → " + target);
 					Notify(msg);
 				}
 				return;
 			}
 
-			DiagErr("verify fail reason=" + verifyReason + " path=" + path);
+			DiagErr("verify fail reason=" + verifyReason + " path=" + target);
 
 			// ⑥ 重试一次：**直接写最终路径**（绕过 tmp 环节，排除 Move 造成的损坏）
 			Error err2 = Error.Ok;
-			try { err2 = ResourceSaver.Save(snapshot, path, ResourceSaver.SaverFlags.None); }
+			try { err2 = ResourceSaver.Save(snapshot, target, ResourceSaver.SaverFlags.None); }
 			catch (Exception retryEx)
 			{
-				DiagErr("verify retry fail stage=saver(throw) err=" + retryEx.GetBaseException().Message + " path=" + path);
+				DiagErr("verify retry fail stage=saver(throw) err=" + retryEx.GetBaseException().Message + " path=" + target);
 				err2 = Error.Failed;
 			}
-			if (err2 == Error.Ok && VerifySaved(path, out string retryReason))
+			if (err2 == Error.Ok && VerifySaved(target, out string retryReason))
 			{
-				Diag("verify ok(after direct-write retry) path=" + path + " size=" + FileSize(path));
+				Diag("verify ok(after direct-write retry) path=" + target + " size=" + FileSize(target));
+				if (!holdPrimary) { UpdateVerifiedCopy(path); }
 				return;
 			}
 			DiagErr("verify fail after retry err=" + err2
-				+ " reason=" + (err2 == Error.Ok ? verifyReason : "(saver " + err2 + ")") + " path=" + path);
+				+ " reason=" + (err2 == Error.Ok ? verifyReason : "(saver " + err2 + ")") + " path=" + target);
 
 			// ⑦ 两次自检都失败 ⇒ 把旧档放回去（不覆盖好档），让玩家下次至少还有上一份可读的档
-			RestorePrimaryFromBackup(path);
+			//    保护期内失败的是旁路文件，主档根本没被动过 ⇒ 不动主档。
+			if (!holdPrimary)
+			{
+				if (IoExists(NativeVerifiedPath(path)))
+				{
+					// v3.4.0：verified 是"最近一次自检通过"的档，比 pre-relaxed 更新，优先用它回退
+					Diag("rollback: prefer verified copy path=" + NativeVerifiedPath(path));
+					RestorePrimaryFromVerified(path);
+				}
+				else
+				{
+					RestorePrimaryFromBackup(path);
+				}
+			}
 		}
 		catch (Exception ex)
 		{
@@ -810,21 +1297,85 @@ public sealed class CommunityLevelSaveEntry : IXWModRuntimeEntry
 	{
 		try
 		{
-			string srcG = Globalize(primary);
-			if (!System.IO.File.Exists(srcG)) { return; }
+			if (!IoExists(primary)) { return; }
 			string backup = NativeBackupPath(primary);
-			string dstG = Globalize(backup);
-			if (System.IO.File.Exists(dstG))
+			if (IoExists(backup))
 			{
 				Log("旧档备份已存在，保持不动：" + backup);
 				return;
 			}
-			System.IO.File.Copy(srcG, dstG, false);
-			Diag("backup ok from=" + primary + " to=" + backup + " size=" + FileSize(backup));
+			if (!IoCopy(primary, backup, "backup", overwrite: false))
+			{
+				return;   // IoCopy 内部已 DiagErr（含 stage=backup 与路径长度）
+			}
+			Diag("backup ok from=" + primary + " to=" + backup + " size=" + FileSize(backup)
+				+ " len=" + PathLen(backup));
 		}
 		catch (Exception ex)
 		{
 			DiagErr("backup fail err=" + ex.GetBaseException().Message + " primary=" + primary);
+		}
+	}
+
+	/// <summary>
+	/// ★ v3.4.0（B.1）维护 verified 副本：仅在"写主档 + 回读自检通过"之后调用。
+	/// 覆盖式，只保留最近一次自检通过的档 ⇒ 这是玩家手上"最新的确定可读档"。
+	/// </summary>
+	private void UpdateVerifiedCopy(string primary)
+	{
+		try
+		{
+			string verified = NativeVerifiedPath(primary);
+			if (!IoExists(primary)) { return; }
+			// 先写临时再 Move，避免"复制到一半崩"把 verified 也弄坏
+			string vt = verified + ".tmp";
+			IoDelete(vt, "verified-tmp");
+			if (!IoCopy(primary, vt, "verified-write"))
+			{
+				return;
+			}
+			if (!IoMove(vt, verified, "verified-commit"))
+			{
+				IoDelete(vt, "verified-tmp");
+				return;
+			}
+			// 回读确认 verified 自身可读（否则下次回退也没意义）
+			if (LoadProgressFile(verified) == null)
+			{
+				DiagErr("verified copy unreadable after write path=" + verified + " len=" + PathLen(verified));
+				return;
+			}
+			Diag("verified ok path=" + verified + " size=" + FileSize(verified) + " len=" + PathLen(verified));
+		}
+		catch (Exception ex)
+		{
+			DiagErr("verified 维护异常：" + ex.GetBaseException().Message);
+		}
+	}
+
+	/// <summary>★ v3.4.0（B）自检两次都失败时，优先用 verified 把主档放回去（比 pre-relaxed 更新）。</summary>
+	private void RestorePrimaryFromVerified(string primary)
+	{
+		try
+		{
+			string verified = NativeVerifiedPath(primary);
+			if (!IoExists(verified))
+			{
+				DiagErr("rollback(verified) skip: verified missing path=" + verified);
+				RestorePrimaryFromBackup(primary);
+				return;
+			}
+			if (!IoCopy(verified, primary, "rollback-verified"))
+			{
+				return;
+			}
+			Diag("rollback ok restored primary from verified=" + verified
+				+ " size=" + FileSize(primary) + " len=" + PathLen(primary));
+			NotifyCorrupt(primary, "写入后回读失败，已回退到最近一次校验通过的副本");
+		}
+		catch (Exception ex)
+		{
+			DiagErr("rollback(verified) 异常：" + ex.GetBaseException().Message);
 		}
 	}
 
@@ -866,13 +1417,16 @@ public sealed class CommunityLevelSaveEntry : IXWModRuntimeEntry
 		try
 		{
 			string backup = NativeBackupPath(primary);
-			if (!System.IO.File.Exists(Globalize(backup)))
+			if (!IoExists(backup))
 			{
 				DiagErr("rollback skip: no backup available, primary left as-is path=" + primary);
 				NotifyCorrupt(primary, "写入后回读失败，且没有可回退的备份");
 				return;
 			}
-			System.IO.File.Copy(Globalize(backup), Globalize(primary), true);
+			if (!IoCopy(backup, primary, "rollback-backup"))
+			{
+				return;
+			}
 			Diag("rollback ok restored primary from=" + backup + " size=" + FileSize(primary));
 			NotifyCorrupt(primary, "写入后回读失败，已回退到备份");
 		}
@@ -901,6 +1455,21 @@ public sealed class CommunityLevelSaveEntry : IXWModRuntimeEntry
 	}
 
 	/// <summary>
+	/// ★ v3.4.0（B.1）verified 副本名：`X.verified.tres`（覆盖式，只保留最近一份）。
+	/// 语义：**最近一次"写后回读自检通过"的档**，与宿主 `.pre-relaxed.tres`（最早那份好档）互补。
+	/// </summary>
+	private static string NativeVerifiedPath(string primary)
+	{
+		return primary.TrimSuffix(".tres") + ".verified.tres";
+	}
+
+	/// <summary>★ v3.4.0（A）恢复保护期内不写主档时，改为写这个旁路文件（不参与恢复）。</summary>
+	private static string NativeRecoverSidePath(string primary)
+	{
+		return primary.TrimSuffix(".tres") + ".recover.tres";
+	}
+
+	/// <summary>
 	/// 用户名脱敏：**必须与宿主 _safeCharRegex = new Regex("[^\\\\w\\\\-\\\\.]") 完全一致**
 	/// （GameSaveManager.cs:104）。曾经用 [^\\w-]（少了 \\.），用户名含 "." 时本 Mod 写进
 	/// 一个宿主永远不看的目录 ⇒ 玩家"明明有存档"却报"文件不存在"。
@@ -925,17 +1494,87 @@ public sealed class CommunityLevelSaveEntry : IXWModRuntimeEntry
 	/// </summary>
 	private static bool IsExpiredLevelName(string levelName)
 	{
-		const int prefixLen = 11;   // "DailyLevel-".Length
+		const int prefixLen = 11;   // [v3.5.0] "DailyLevel-".Length
 		if (string.IsNullOrEmpty(levelName) || levelName.Length < prefixLen + 10) { return false; }
-		string date = levelName.Substring(prefixLen, 10);
-		if (!DateTime.TryParseExact(date, "yyyy-MM-dd",
-				System.Globalization.CultureInfo.InvariantCulture,
-				System.Globalization.DateTimeStyles.None, out DateTime parsed))
-		{
-			return false;   // 名字里没有可解析的日期 ⇒ 不判过期，交给读取器自检
-		}
-		return parsed.Date != DateTime.Now.Date;
+		return !LevelDateIsToday(levelName.Substring(prefixLen, 10));
 	}
+
+	/// <summary>
+	/// 判断关卡名里那 10 个字符（理应 "yyyy-MM-dd"）是不是**今天**的日期。
+	/// <para>返回 true = 是今天 / 解析不出来（保守当作今天，不判过期）。</para>
+	///
+	/// ★★★ v3.5.0 修复（玩家实测 + 精确定位，本作 BCL 裁剪的又一例）：
+	///   旧实现用 `DateTime.TryParseExact(date, "yyyy-MM-dd", …)`。
+	///   本作运行时把 System.Private.CoreLib **裁掉了一批方法** —— 注意
+	///   "System.Private.CoreLib.dll 里能搜到 TryParseExact 这个字符串"**不能**当证据（元数据还在、
+	///   实现被裁），真实调用会抛：
+	///       Method not found: Boolean System.DateTime.TryParseExact(...)
+	///   而这个异常发生在 `TickRestoreArm` 里被外层 catch 吞掉 ⇒ 立刻 `_armDecided = true`
+	///   ⇒ 本次恢复**永久放弃**（hasProgress 不设），表现为"第一次能读、之后再进就报错/读不了"。
+	///   同类旧账：`PropertyInfo.get_CanWrite`（见 DoubleSpeedToggle 的 v1.4.5 教训）。
+	///
+	/// ★ 为什么改成"Godot 引擎取今天 + 纯字符串比较"：
+	///   1. **完全不碰 BCL 日期解析**（TryParseExact / ParseExact / DateTime.Parse 一律不用），
+	///      只用 `string` 比较 ⇒ 不可能再缺方法。
+	///   2. `Godot.Time.GetDateStringFromSystem()` 由引擎（C++）提供，已在 GodotSharp.dll 里确认存在，
+	///      返回的正是本地时间的 "yyyy-MM-dd"，格式与关卡名里的那 10 个字符完全一致。
+	///   3. 取不到（返回空）时**保守当作"今天"**（不判过期）—— 宁可多尝试恢复一次，
+	///      也不要因为环境差异把玩家当天的档误判成过期而拒绝恢复。
+	/// </summary>
+	private static bool LevelDateIsToday(string date)
+	{
+		try
+		{
+			if (string.IsNullOrEmpty(date) || date.Length != 10) { return true; }
+			if (date[4] != '-' || date[7] != '-') { return true; }   // 不是 yyyy-MM-dd 形状 ⇒ 不判过期
+			for (int i = 0; i < date.Length; i++)
+			{
+				if (i == 4 || i == 7) { continue; }
+				if (date[i] < '0' || date[i] > '9') { return true; }  // 非数字 ⇒ 不判过期
+			}
+			string today = TodayString();
+			if (string.IsNullOrEmpty(today)) { return true; }          // 取不到今天就保守不判过期
+			return string.Equals(date, today, StringComparison.Ordinal);
+		}
+		catch { return true; }
+	}
+
+	/// <summary>
+	/// "今天"的本地日期串（yyyy-MM-dd），**只依赖 Godot 引擎**，不碰 BCL 日期解析。
+	/// `Godot.Time.GetDateStringFromSystem()` 返回本地时间日期（引擎内部用 OS 本地时区），
+	/// 与宿主 `DailyChallengeLevelChoose` 生成关卡名时用的日期口径一致。
+	/// 万一引擎接口不可用（老版本/异常）⇒ 返回 ""（调用方按"不判过期"处理，绝不误杀存档）。
+	/// </summary>
+	private static string TodayString()
+	{
+		try
+		{
+			string s = Time.GetDateStringFromSystem();   // 例："2026-10-28"
+			if (!string.IsNullOrEmpty(s) && s.Length >= 10) { return s.Substring(0, 10); }
+		}
+		catch (Exception ex) { Diag("today-string unavailable（按不判过期处理）：" + ex.GetBaseException().Message); }
+		return "";
+	}
+	/// <summary>
+	/// 取证档的时间戳（yyyyMMdd-HHmmss），同样**只用引擎接口**：
+	/// `Time.GetDateStringFromSystem()` + `Time.GetTimeStringFromSystem()`（后者形如 "17:03:39"）。
+	/// 拼不成时退化为空串 ⇒ 用固定名（调用方会加序号）。
+	/// </summary>
+	private static string FailedSnapshotStamp()
+	{
+		try
+		{
+			string d = Time.GetDateStringFromSystem();      // 2026-10-28
+			string t = Time.GetTimeStringFromSystem();      // 17:03:39
+			if (string.IsNullOrEmpty(d) || string.IsNullOrEmpty(t)) { return ""; }
+			string dd = d.Replace("-", "");                 // 20261028
+			string tt = t.Replace(":", "");                 // 170339
+			if (dd.Length < 8 || tt.Length < 6) { return ""; }
+			return dd.Substring(0, 8) + "-" + tt.Substring(0, 6);
+		}
+		catch { return ""; }
+	}
+
 
 	/// <summary>内容损坏/反序列化失败：提示要具体（保留原档 + 说清坏的是哪个文件）。</summary>
 	private void NotifyCorrupt(string path, string reason)
@@ -943,7 +1582,11 @@ public sealed class CommunityLevelSaveEntry : IXWModRuntimeEntry
 		Notify("存档损坏，未恢复（原文件已保留）\n文件：" + path + "\n原因：" + reason, 480);
 	}
 
-	/// <summary>删除进度档（通关/失败防刷）。v3.2：改为精确删三个已知文件，不再用通配符扫目录。</summary>
+	/// <summary>
+	/// 删除进度档（通关/失败防刷）。v3.2：精确删已知文件，不再用通配符扫目录。
+	/// v3.4.0：新增删 `.verified.tres` / `.recover.tres`（否则清档后 verified 仍存在，
+	/// 下一局可能被 verified 回退"复活"上一局进度，破坏防刷语义）；全部走长路径 IoDelete。
+	/// </summary>
 	private void DeleteSave(string levelName)
 	{
 		try
@@ -952,19 +1595,21 @@ public sealed class CommunityLevelSaveEntry : IXWModRuntimeEntry
 			if (string.IsNullOrEmpty(path)) { return; }
 			string[] targets =
 			{
-				path,                                   // 主进度档
-				NativeBackupPath(path),                 // 宿主备份档 .pre-relaxed.tres
-				path.TrimSuffix(".tres") + ".tmp.tres"  // 未落地的临时档
+				path,                                    // 主进度档
+				NativeBackupPath(path),                  // 宿主备份档 .pre-relaxed.tres
+				NativeVerifiedPath(path),                // ★ v3.4.0 verified 副本
+				NativeRecoverSidePath(path),             // ★ v3.4.0 保护期旁路档
+				path.TrimSuffix(".tres") + ".tmp.tres"   // 未落地的临时档
 			};
 			foreach (string p in targets)
 			{
-				try
+				if (!IoExists(p)) { continue; }
+				if (IoDelete(p, "clear-save"))
 				{
-					string g = ProjectSettings.GlobalizePath(p);
-					if (System.IO.File.Exists(g)) { System.IO.File.Delete(g); }
+					Log("已删除：" + p);
 				}
-				catch (Exception ex) { Warn("删除存档失败（" + p + "）：" + ex.GetBaseException().Message); }
 			}
+			Diag("clear-save done level=" + levelName);
 		}
 		catch (Exception ex) { Warn("删除存档失败：" + ex.GetBaseException().Message); }
 	}
@@ -976,24 +1621,160 @@ public sealed class CommunityLevelSaveEntry : IXWModRuntimeEntry
 		try { return ProjectSettings.GlobalizePath(userPath); } catch { return userPath; }
 	}
 
-	private static void DeleteGlobalized(string userPath)
+	/// <summary>
+	/// ★ v3.4.0（C）长路径加固：把 `user://…` 换成**可用于 .NET 文件 API 的绝对路径**。
+	///
+	/// 背景：那位玩家的用户名脱敏后 >100 字符，实际路径形如
+	/// `C:\Users\xxx\AppData\Roaming\Godot\app_userdata\植物大战僵尸杂交版\Csharp\Progress\
+	///  _rainbow_freq_1.0_…_爱猫人__wave___rainbow_\DailyLevel-2026-10-28-654.tres`
+	/// 轻松超过 Windows 传统 MAX_PATH(260)。Godot 自己的 `FileAccess` 走引擎封装，行为与 .NET
+	/// 不同（能读写）；但本 Mod 手写的 `System.IO.File.Move/Copy/Delete/FileInfo` 在 .NET 上
+	/// **默认受 MAX_PATH 限制** ⇒ 会出现"ResourceSaver 写成功、Move 失败"这种半成功。
+	///
+	/// 加固方式：Windows 上对**绝对路径**加 `\\?\` 前缀（Long Path 语法，绕过 260 限制；
+	/// 要求路径已是绝对路径且用反斜杠，这里同时把 `/` 归一化为 `\`）。
+	/// 非 Windows 原样返回（Unix 没有这个限制）。
+	/// 注意：`\\?\` 前缀只用于 .NET IO API，**不能**传给 Godot 的 FileAccess/ResourceLoader，
+	/// 那两处继续用 original `user://` 路径。
+	/// </summary>
+	private static string IoPath(string userPath)
+	{
+		string abs = Globalize(userPath);
+		return LongPath(abs);
+	}
+
+	/// <summary>纯绝对路径 → 长路径形式（见 IoPath 注释）。失败则原样返回。</summary>
+	private static string LongPath(string abs)
 	{
 		try
 		{
-			string g = Globalize(userPath);
-			if (System.IO.File.Exists(g)) { System.IO.File.Delete(g); }
+			if (string.IsNullOrEmpty(abs)) { return abs; }
+			if (System.IO.Path.DirectorySeparatorChar != '\\') { return abs; }   // 非 Windows
+			if (abs.StartsWith(@"\\?\", StringComparison.Ordinal)) { return abs; }
+			string norm = abs.Replace('/', '\\');
+			if (!System.IO.Path.IsPathRooted(norm)) { return abs; }
+			// UNC（\\server\share）→ \\?\UNC\server\share
+			if (norm.StartsWith(@"\\", StringComparison.Ordinal))
+			{
+				return @"\\?\UNC\" + norm.Substring(2);
+			}
+			return @"\\?\" + norm;
 		}
-		catch { }
+		catch { return abs; }
+	}
+
+	/// <summary>路径长度（诊断用；返回 -1 表示无法计算）。</summary>
+	private static int PathLen(string userPath)
+	{
+		try
+		{
+			string abs = Globalize(userPath);
+			return string.IsNullOrEmpty(abs) ? -1 : abs.Length;
+		}
+		catch { return -1; }
+	}
+
+	private static bool IoExists(string userPath)
+	{
+		try
+		{
+			if (string.IsNullOrEmpty(userPath)) { return false; }
+			// 先用 Godot 的 FileAccess 判存在（它对 user:// 与长路径最稳），
+			// 再用 .NET 兜底（有些情况下 FileAccess 对绝对路径不生效）
+			if (Godot.FileAccess.FileExists(userPath)) { return true; }
+			return System.IO.File.Exists(IoPath(userPath));
+		}
+		catch { return false; }
+	}
+
+	private static bool IoDelete(string userPath, string stage = "delete")
+	{
+		try
+		{
+			string g = IoPath(userPath);
+			if (!System.IO.File.Exists(g)) { return true; }
+			System.IO.File.Delete(g);
+			return true;
+		}
+		catch (Exception ex)
+		{
+			DiagErr("io fail stage=" + stage + "(delete) err=" + ex.GetBaseException().Message
+				+ " path=" + userPath + " len=" + PathLen(userPath));
+			return false;
+		}
+	}
+
+	private static bool IoCopy(string src, string dst, string stage = "copy", bool overwrite = true)
+	{
+		try
+		{
+			string gs = IoPath(src);
+			string gd = IoPath(dst);
+			EnsureDir(dst, stage);
+			System.IO.File.Copy(gs, gd, overwrite);
+			return true;
+		}
+		catch (Exception ex)
+		{
+			DiagErr("io fail stage=" + stage + "(copy) err=" + ex.GetBaseException().Message
+				+ " src=" + src + " len=" + PathLen(src)
+				+ " dst=" + dst + " len=" + PathLen(dst));
+			return false;
+		}
+	}
+
+	private static bool IoMove(string src, string dst, string stage = "move", bool overwrite = true)
+	{
+		try
+		{
+			string gs = IoPath(src);
+			string gd = IoPath(dst);
+			EnsureDir(dst, stage);
+			System.IO.File.Move(gs, gd, overwrite);
+			return true;
+		}
+		catch (Exception ex)
+		{
+			DiagErr("io fail stage=" + stage + "(move) err=" + ex.GetBaseException().Message
+				+ " src=" + src + " len=" + PathLen(src)
+				+ " dst=" + dst + " len=" + PathLen(dst));
+			return false;
+		}
+	}
+
+	/// <summary>确保目标文件所在目录存在（用长路径形式创建）。</summary>
+	private static void EnsureDir(string userFile, string stage)
+	{
+		try
+		{
+			string g = IoPath(userFile);
+			string dir = System.IO.Path.GetDirectoryName(g);
+			if (!string.IsNullOrEmpty(dir) && !System.IO.Directory.Exists(dir))
+			{
+				System.IO.Directory.CreateDirectory(dir);
+			}
+		}
+		catch (Exception ex)
+		{
+			DiagErr("io fail stage=" + stage + "(mkdir) err=" + ex.GetBaseException().Message
+				+ " path=" + userFile + " len=" + PathLen(userFile));
+		}
 	}
 
 	private static long FileSize(string userPath)
 	{
 		try
 		{
-			string g = Globalize(userPath);
+			string g = IoPath(userPath);
 			return System.IO.File.Exists(g) ? new System.IO.FileInfo(g).Length : -1;
 		}
 		catch { return -1; }
+	}
+
+	/// <summary>兼容旧调用名（内部已改为长路径安全的 IoDelete）。</summary>
+	private static void DeleteGlobalized(string userPath)
+	{
+		IoDelete(userPath, "tmp-cleanup");
 	}
 
 	// ============================================================ 提示 / 配置 / 日志
